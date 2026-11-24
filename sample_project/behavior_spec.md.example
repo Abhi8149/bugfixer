@@ -1,0 +1,82 @@
+ORDER PROCESSING EXPECTED BEHAVIOUR
+
+PRODUCTS AND INVENTORY
+
+1. A product has SKU, name, category, price and weight (kg).
+   Categories: electronics (18% tax), clothing (12%), grocery (5%),
+   books (0%). Price cannot be negative. Weight must be > 0.
+
+2. Inventory available stock = physical stock - reserved stock.
+
+3. Reserving more than the available stock is an error.
+
+4. Releasing a reservation decreases ONLY the reserved count.
+   The units never left the warehouse, so physical stock is unchanged.
+
+5. Committing at shipping decreases BOTH physical and reserved
+   stock. Example: stock 10, reserved 3, commit 3 -> stock 7,
+   reserved 0, available 7.
+
+CART AND COUPONS
+
+6. Adding the same SKU to a cart again increases its quantity.
+
+7. A percent coupon applies only to eligible categories.
+   Example: 10% electronics-only coupon; books 100 + electronics
+   100 -> discount is 10, not 20.
+
+8. A fixed coupon is limited to the eligible subtotal.
+   A coupon's max_discount, if set, caps the discount.
+   A coupon whose min_subtotal is not reached is an error.
+
+PRICING PIPELINE (this order must be followed)
+
+9. Subtotal first, then coupon discount, then tax, then shipping.
+
+10. Tax is charged per line on the amount AFTER that line's share
+    of the discount. Example: electronics 100, discount share 10
+    -> taxable 90 -> tax 16.2 (not 18.0).
+
+11. The discount is shared across eligible lines in proportion to
+    their subtotals. Ineligible lines receive no discount share.
+
+12. Shipping base depends on the DISCOUNTED subtotal:
+    500 or more = free, 200-499.99 = 40, below 200 = 60.
+    Example: subtotal 550 with 20% coupon -> discounted 440 ->
+    base shipping 40 (not free).
+
+13. Weight surcharge: first 5 kg included; each extra kilogram OR
+    PART of one (rounded up) costs 30, even if base shipping is free.
+    Example: 7.2 kg -> 3 extra units -> surcharge 90.
+
+14. Empty cart: every charge is 0, including shipping.
+
+15. Total = (subtotal - discount) + tax + shipping.
+    Money is rounded to two decimal places.
+
+ORDERS
+
+16. Order lifecycle: CREATED -> PLACED -> PAID -> SHIPPED.
+    Cancellation is allowed from CREATED, PLACED or PAID only.
+
+17. Placing an order reserves stock ALL-OR-NOTHING.
+    Example: stock A=5, B=1; cart needs A=2, B=3 -> placing fails
+    and A's available stock is still 5 afterwards.
+
+18. Shipping commits stock. Example: stock 10, order of 3 placed,
+    paid and shipped -> stock 7, reserved 0, available 7.
+
+19. Cancelling a placed order restores availability exactly.
+    Example: stock 10, order of 3 placed then cancelled ->
+    stock 10, reserved 0, available 10 (never 13).
+
+20. Payment freezes the per-unit paid price (after discount,
+    including tax) for every line.
+
+21. Returns are allowed only after shipping, never more than was
+    purchased. Returned units go back into physical stock.
+
+22. A return refunds the FROZEN paid price per unit, even if the
+    product price changed after payment.
+    Example: paid 106.2 per unit; price later rises to 150;
+    returning 1 unit refunds 106.2 (not 177.0).

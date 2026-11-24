@@ -1,0 +1,655 @@
+"""
+Order Processing System (complex single-file demo for BugFixer Lite).
+
+Classes and how they interact:
+
+    Product        - something that can be sold (price can change later)
+    Inventory      - physical stock minus reserved stock = available
+    Cart           - what a customer wants to buy
+    Coupon         - percent/fixed discount with rules
+    PricingEngine  - subtotal -> discount -> tax -> shipping -> total
+    PriceBreakdown - the itemised result of a pricing calculation
+    Order          - CREATED -> PLACED -> PAID -> SHIPPED lifecycle,
+                     with cancellation and partial returns
+
+Money rules used everywhere:
+- All money values are rounded to two decimal places.
+- Tax is charged per category: electronics 18%, clothing 12%,
+  grocery 5%, books 0%.
+
+The docstrings are the specification. Every rule has a concrete
+numeric example, and the examples describe the CORRECT behaviour.
+"""
+
+import math
+
+TAX_RATES = {
+    "electronics": 0.18,
+    "clothing": 0.12,
+    "grocery": 0.05,
+    "books": 0.0,
+}
+
+# Shipping rules (see PricingEngine.calculate_shipping).
+FREE_SHIPPING_THRESHOLD = 500.0
+MID_TIER_THRESHOLD = 200.0
+MID_TIER_SHIPPING = 40.0
+LOW_TIER_SHIPPING = 60.0
+INCLUDED_WEIGHT_KG = 5.0
+EXTRA_KG_CHARGE = 30.0
+
+
+class Product:
+    """One sellable product. Its price may change over time."""
+
+    def __init__(self, sku: str, name: str, category: str, price, weight_kg):
+        """
+        Rules:
+        - SKU and name cannot be empty.
+        - Category must be one of: electronics, clothing, grocery, books.
+        - Price cannot be negative.
+        - Weight must be greater than zero (kilograms).
+        """
+        if not sku:
+            raise ValueError("SKU cannot be empty")
+        if not name:
+            raise ValueError("Product name cannot be empty")
+        if category not in TAX_RATES:
+            raise ValueError(f"Unknown category: {category}")
+        if price < 0:
+            raise ValueError("Price cannot be negative")
+        if weight_kg <= 0:
+            raise ValueError("Weight must be greater than zero")
+
+        self.sku = sku
+        self.name = name
+        self.category = category
+        self.price = price
+        self.weight_kg = weight_kg
+
+    def set_price(self, new_price):
+        """Change the selling price. Orders already paid are not affected."""
+        if new_price < 0:
+            raise ValueError("Price cannot be negative")
+        self.price = new_price
+
+
+class Inventory:
+    """
+    Tracks stock per SKU.
+
+    Two numbers matter for every SKU:
+    - physical stock: units actually in the warehouse.
+    - reserved stock: units promised to placed (not yet shipped) orders.
+    Available stock = physical stock - reserved stock.
+    """
+
+    def __init__(self):
+        self._stock = {}
+        self._reserved = {}
+
+    def add_stock(self, product: Product, quantity: int):
+        """Add physical units of a product. Quantity must be positive."""
+        if not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("Quantity must be a positive integer")
+        self._stock[product.sku] = self._stock.get(product.sku, 0) + quantity
+        self._reserved.setdefault(product.sku, 0)
+
+    def get_stock(self, sku: str) -> int:
+        """Physical units in the warehouse (0 for an unknown SKU)."""
+        return self._stock.get(sku, 0)
+
+    def get_reserved(self, sku: str) -> int:
+        """Units currently reserved by placed orders."""
+        return self._reserved.get(sku, 0)
+
+    def get_available(self, sku: str) -> int:
+        """Available = physical - reserved. Never negative in valid use."""
+        return self.get_stock(sku) - self.get_reserved(sku)
+
+    def reserve(self, sku: str, quantity: int):
+        """
+        Reserve units for an order.
+
+        Raises ValueError if quantity is not positive or if the
+        available stock is less than the requested quantity.
+        """
+        if not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("Quantity must be a positive integer")
+        if quantity > self.get_available(sku):
+            raise ValueError(f"Not enough available stock for {sku}")
+        self._reserved[sku] = self.get_reserved(sku) + quantity
+
+    def release(self, sku: str, quantity: int):
+        """
+        Give back a reservation (for example when an order is cancelled
+        before shipping). The units were always physically present, so
+        ONLY the reserved count decreases; physical stock must not change.
+        """
+        if quantity > self.get_reserved(sku):
+            raise ValueError("Cannot release more than is reserved")
+        self._reserved[sku] = self.get_reserved(sku) - quantity
+
+    def commit(self, sku: str, quantity: int):
+        """
+        Complete a sale at shipping time: the units leave the warehouse.
+
+        BOTH numbers must decrease together:
+        - physical stock decreases (units are gone), and
+        - reserved stock decreases (the promise is now fulfilled).
+        Example: stock 10, reserved 3, commit 3 -> stock 7, reserved 0,
+        so available stays 7. Available must not drop twice for one sale.
+        """
+        if quantity > self.get_stock(sku):
+            raise ValueError("Cannot commit more than the physical stock")
+        if quantity > self.get_reserved(sku):
+            raise ValueError("Cannot commit more than is reserved")
+        self._stock[sku] = self.get_stock(sku) - quantity
+        self._reserved[sku] = self.get_reserved(sku) - quantity
+
+    def restock(self, sku: str, quantity: int):
+        """Put returned units back into physical stock."""
+        if not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("Quantity must be a positive integer")
+        self._stock[sku] = self.get_stock(sku) + quantity
+        self._reserved.setdefault(sku, 0)
+
+
+class Cart:
+    """A customer's cart: products and quantities, in insertion order."""
+
+    def __init__(self):
+        self._items = {}  # sku -> {"product": Product, "quantity": int}
+
+    def add(self, product: Product, quantity: int = 1):
+        """
+        Add a product. Adding the same SKU again increases its quantity.
+        Quantity must be a positive integer.
+        """
+        if not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("Quantity must be a positive integer")
+        if product.sku in self._items:
+            self._items[product.sku]["quantity"] += quantity
+        else:
+            self._items[product.sku] = {"product": product, "quantity": quantity}
+
+    def remove(self, sku: str):
+        """Remove a line completely. Unknown SKU raises ValueError."""
+        if sku not in self._items:
+            raise ValueError(f"SKU not in cart: {sku}")
+        del self._items[sku]
+
+    def is_empty(self) -> bool:
+        return len(self._items) == 0
+
+    def lines(self):
+        """Return cart lines as a list of dictionaries (insertion order)."""
+        result = []
+        for sku, entry in self._items.items():
+            product = entry["product"]
+            quantity = entry["quantity"]
+            result.append({
+                "sku": sku,
+                "product": product,
+                "quantity": quantity,
+                "unit_price": product.price,
+                "line_subtotal": round(product.price * quantity, 2),
+                "weight_kg": product.weight_kg * quantity,
+            })
+        return result
+
+    def subtotal(self):
+        """Sum of price * quantity over all lines, rounded to 2 places."""
+        return round(sum(line["line_subtotal"] for line in self.lines()), 2)
+
+    def total_weight_kg(self):
+        """Total weight of everything in the cart, in kilograms."""
+        return sum(line["weight_kg"] for line in self.lines())
+
+
+class Coupon:
+    """A discount coupon with spending and category rules."""
+
+    def __init__(self, code: str, discount_type: str, value,
+                 min_subtotal=0, eligible_categories=None,
+                 max_discount=None, active: bool = True):
+        """
+        Rules:
+        - discount_type is "percent" or "fixed".
+        - A percent value must be between 0 and 100. A fixed value
+          (money off) cannot be negative.
+        - min_subtotal: the cart subtotal (before discount) must reach
+          this amount for the coupon to apply.
+        - eligible_categories: None means every category is eligible.
+          Otherwise only lines in these categories count towards the
+          discount.
+        - max_discount: if given, the discount can never exceed it.
+        """
+        if not code:
+            raise ValueError("Coupon code cannot be empty")
+        if discount_type not in ("percent", "fixed"):
+            raise ValueError("discount_type must be 'percent' or 'fixed'")
+        if discount_type == "percent" and (value < 0 or value > 100):
+            raise ValueError("Percent discount must be between 0 and 100")
+        if discount_type == "fixed" and value < 0:
+            raise ValueError("Fixed discount cannot be negative")
+        if min_subtotal < 0:
+            raise ValueError("min_subtotal cannot be negative")
+        if max_discount is not None and max_discount < 0:
+            raise ValueError("max_discount cannot be negative")
+        if eligible_categories is not None:
+            for category in eligible_categories:
+                if category not in TAX_RATES:
+                    raise ValueError(f"Unknown category: {category}")
+
+        self.code = code
+        self.discount_type = discount_type
+        self.value = value
+        self.min_subtotal = min_subtotal
+        self.eligible_categories = eligible_categories
+        self.max_discount = max_discount
+        self.active = active
+
+    def is_eligible_line(self, line) -> bool:
+        """True if this coupon may discount the given cart line."""
+        if self.eligible_categories is None:
+            return True
+        return line["product"].category in self.eligible_categories
+
+
+
+class PriceBreakdown:
+    """Itemised result of one pricing calculation."""
+
+    def __init__(self, subtotal, discount, tax, shipping, total, line_details):
+        self.subtotal = subtotal
+        self.discount = discount
+        self.tax = tax
+        self.shipping = shipping
+        self.total = total
+        # One dict per cart line: sku, quantity, unit_price,
+        # line_subtotal, discount_allocated, taxable_amount, tax,
+        # line_total (paid amount for the line incl. its tax).
+        self.line_details = line_details
+
+    @property
+    def discounted_subtotal(self):
+        """What the customer pays for goods after discount, before tax."""
+        return round(self.subtotal - self.discount, 2)
+
+    def as_dict(self):
+        return {
+            "subtotal": self.subtotal,
+            "discount": self.discount,
+            "discounted_subtotal": self.discounted_subtotal,
+            "tax": self.tax,
+            "shipping": self.shipping,
+            "total": self.total,
+            "line_details": self.line_details,
+        }
+
+
+class PricingEngine:
+    """
+    Calculates the final price of a cart.
+
+    The pipeline order is fixed and must not be rearranged:
+        1. Subtotal (sum of all lines)
+        2. Coupon discount (eligible lines only, capped)
+        3. Tax, charged on each line AFTER its share of discount
+        4. Shipping, based on the discounted subtotal and weight
+        5. Total = discounted subtotal + tax + shipping
+    """
+
+    def calculate_discount(self, cart: Cart, coupon: Coupon = None):
+        """
+        Return the coupon discount amount for this cart.
+
+        Rules:
+        - No coupon, or an inactive coupon, means discount 0.
+        - If the cart subtotal is below the coupon's min_subtotal,
+          raise ValueError.
+        - A percent coupon applies ONLY to the eligible subtotal:
+          the sum of line subtotals the coupon is eligible for.
+          Example: 10% electronics-only coupon, cart has books 100
+          and electronics 100 -> eligible subtotal is 100, so the
+          discount is 10 (not 20).
+        - A fixed coupon is limited to the eligible subtotal.
+        - If max_discount is set, the discount never exceeds it.
+        """
+        if coupon is None or not coupon.active:
+            return 0.0
+
+        subtotal = cart.subtotal()
+        if subtotal < coupon.min_subtotal:
+            raise ValueError("Cart subtotal is below the coupon minimum")
+
+        eligible_subtotal = round(
+            sum(line["line_subtotal"] for line in cart.lines()
+                if coupon.is_eligible_line(line)),
+            2,
+        )
+
+        if coupon.discount_type == "percent":
+            discount = round(eligible_subtotal * coupon.value / 100, 2)
+        else:
+            discount = round(min(coupon.value, eligible_subtotal), 2)
+
+        if coupon.max_discount is not None:
+            discount = min(discount, coupon.max_discount)
+        return round(min(discount, eligible_subtotal), 2)
+
+    def _allocate_discount(self, cart: Cart, coupon: Coupon, discount):
+        """
+        Split the discount across eligible lines, in proportion to
+        each eligible line's subtotal. Ineligible lines get 0.
+        Allocations are rounded to 2 places; small rounding
+        differences are adjusted on the largest eligible line so the
+        allocations add up exactly to the discount.
+        Returns: dict sku -> allocated discount.
+        """
+        allocations = {line["sku"]: 0.0 for line in cart.lines()}
+        if not discount:
+            return allocations
+
+        eligible = [line for line in cart.lines()
+                    if coupon is not None and coupon.is_eligible_line(line)]
+        eligible_total = sum(line["line_subtotal"] for line in eligible)
+        if eligible_total == 0:
+            return allocations
+
+        allocated_so_far = 0.0
+        for line in eligible:
+            share = round(discount * line["line_subtotal"] / eligible_total, 2)
+            allocations[line["sku"]] = share
+            allocated_so_far += share
+
+        difference = round(discount - allocated_so_far, 2)
+        if difference != 0 and eligible:
+            largest = max(eligible, key=lambda line: line["line_subtotal"])
+            allocations[largest["sku"]] = round(
+                allocations[largest["sku"]] + difference, 2
+            )
+        return allocations
+
+    def calculate_tax_for_line(self, line, discount_allocated):
+        """
+        Tax for one line, charged on the amount AFTER discount.
+
+        taxable amount = line subtotal - allocated discount, then
+        multiplied by the category tax rate, rounded to 2 places.
+        Example: electronics line 100 with 10 discount allocated ->
+        taxable 90, tax = 90 * 0.18 = 16.2 (not 18.0).
+        """
+        taxable_amount = round(line["line_subtotal"] - discount_allocated, 2)
+        rate = TAX_RATES[line["product"].category]
+        return round(taxable_amount * rate, 2)
+
+    def calculate_shipping(self, cart: Cart, discounted_subtotal):
+        """
+        Shipping charge for the cart.
+
+        Base shipping depends on the DISCOUNTED subtotal (subtotal
+        after coupon discount, before tax):
+        - 500 or more: base shipping is free (0)
+        - 200 to 499.99: base shipping is 40
+        - below 200: base shipping is 60
+        - an empty cart pays no shipping at all.
+
+        Weight surcharge: the first 5 kg are included. Every kilogram
+        above 5 kg (or part of a kilogram, rounded UP) costs 30.
+        Example: total weight 7.2 kg -> extra 2.2 kg -> rounded up to
+        3 kg -> surcharge 90. The surcharge is charged even when the
+        base shipping is free.
+
+        Example: discounted subtotal 550 with a 20% coupon is wrong
+        to test against 500; the discounted value 440 must be used,
+        so base shipping is 40 (not free).
+        """
+        if cart.is_empty():
+            return 0.0
+
+        if discounted_subtotal >= FREE_SHIPPING_THRESHOLD:
+            base = 0.0
+        elif discounted_subtotal >= MID_TIER_THRESHOLD:
+            base = MID_TIER_SHIPPING
+        else:
+            base = LOW_TIER_SHIPPING
+
+        extra_weight = cart.total_weight_kg() - INCLUDED_WEIGHT_KG
+        if extra_weight > 0:
+            surcharge = math.ceil(extra_weight) * EXTRA_KG_CHARGE
+        else:
+            surcharge = 0.0
+        return round(base + surcharge, 2)
+
+    def calculate(self, cart: Cart, coupon: Coupon = None) -> PriceBreakdown:
+        """
+        Run the full pricing pipeline and return a PriceBreakdown.
+        An empty cart produces all zeros (and no shipping).
+        """
+        lines = cart.lines()
+        subtotal = cart.subtotal()
+        discount = self.calculate_discount(cart, coupon)
+        allocations = self._allocate_discount(cart, coupon, discount)
+
+        line_details = []
+        tax_total = 0.0
+        for line in lines:
+            allocated = allocations.get(line["sku"], 0.0)
+            tax = self.calculate_tax_for_line(line, allocated)
+            tax_total += tax
+            line_details.append({
+                "sku": line["sku"],
+                "quantity": line["quantity"],
+                "unit_price": line["unit_price"],
+                "line_subtotal": line["line_subtotal"],
+                "discount_allocated": allocated,
+                "taxable_amount": round(line["line_subtotal"] - allocated, 2),
+                "tax": tax,
+                "line_total": round(
+                    line["line_subtotal"] - allocated + tax, 2
+                ),
+            })
+
+        tax_total = round(tax_total, 2)
+        discounted_subtotal = round(subtotal - discount, 2)
+        shipping = self.calculate_shipping(cart, discounted_subtotal)
+        total = round(discounted_subtotal + tax_total + shipping, 2)
+
+        return PriceBreakdown(
+            subtotal=subtotal,
+            discount=discount,
+            tax=tax_total,
+            shipping=shipping,
+            total=total,
+            line_details=line_details,
+        )
+
+
+
+class Order:
+    """
+    One order and its lifecycle:
+
+        CREATED --place()--> PLACED --pay()--> PAID --ship()--> SHIPPED
+        CREATED / PLACED / PAID --cancel()--> CANCELLED
+        SHIPPED --return_items()--> SHIPPED (or RETURNED when all back)
+
+    Placing an order RESERVES stock (physical stock does not move).
+    Shipping COMMITS stock (units leave, reservations are fulfilled).
+    """
+
+    def __init__(self, order_id: str, cart: Cart, inventory: Inventory,
+                 coupon: Coupon = None):
+        """
+        Rules:
+        - Order id cannot be empty.
+        - The order remembers the cart, inventory and coupon given here.
+        - A new order has status "CREATED", no breakdown and no refunds.
+        """
+        if not order_id:
+            raise ValueError("Order id cannot be empty")
+
+        self.order_id = order_id
+        self.cart = cart
+        self.inventory = inventory
+        self.coupon = coupon
+        self.pricing_engine = PricingEngine()
+
+        self.status = "CREATED"
+        self.breakdown = None
+        self.refund_due = 0.0
+        self.total_refunded = 0.0
+        self._paid_unit_price_incl_tax = {}
+        self._returned = {}
+
+    def place(self):
+        """
+        Place the order: price it and reserve every line's stock.
+
+        Rules:
+        - Only a CREATED order can be placed.
+        - An empty cart cannot be placed.
+        - Reservation is ALL-OR-NOTHING: if any line does not have
+          enough available stock, ValueError is raised and NO line
+          may remain reserved by this order. Other orders' available
+          stock must be exactly as it was before the failed attempt.
+          Example: stock A=5, B=1; cart needs A=2, B=3. Placing must
+          fail and A's available stock must still be 5 afterwards.
+        """
+        if self.status != "CREATED":
+            raise ValueError("Only a CREATED order can be placed")
+        if self.cart.is_empty():
+            raise ValueError("Cannot place an order with an empty cart")
+
+        self.breakdown = self.pricing_engine.calculate(self.cart, self.coupon)
+
+        reserved_lines = []
+        try:
+            for line in self.cart.lines():
+                self.inventory.reserve(line["sku"], line["quantity"])
+                reserved_lines.append(line)
+        except ValueError:
+            for line in reserved_lines:
+                self.inventory.release(line["sku"], line["quantity"])
+            raise
+
+        self.status = "PLACED"
+        return self.breakdown
+
+    def pay(self):
+        """
+        Mark a PLACED order as paid and freeze what was paid.
+
+        At payment time the per-unit price actually paid (after
+        discount, including that unit's tax) is frozen for every
+        line. Later product price changes must not change refunds
+        for this order. Example: 2 x electronics at 100 with a 10%
+        coupon: line paid = 180 + 32.4 tax = 212.4, so the frozen
+        paid price is 106.2 per unit.
+        """
+        if self.status != "PLACED":
+            raise ValueError("Only a PLACED order can be paid")
+
+        for detail in self.breakdown.line_details:
+            self._paid_unit_price_incl_tax[detail["sku"]] = (
+                detail["line_total"] / detail["quantity"]
+            )
+        self.status = "PAID"
+
+    def ship(self):
+        """
+        Ship a PAID order: commit every line's stock.
+
+        Example: stock 10, this order reserved 3. After shipping:
+        physical stock 7, reserved 0, available 7. The available
+        count must fall only by the units that actually left (3
+        from the pre-reservation count of 10), not twice.
+        """
+        if self.status != "PAID":
+            raise ValueError("Only a PAID order can be shipped")
+
+        for line in self.cart.lines():
+            self.inventory.commit(line["sku"], line["quantity"])
+        self.status = "SHIPPED"
+
+    def cancel(self):
+        """
+        Cancel a CREATED, PLACED or PAID order. Returns the refund
+        due (0 if the order was never paid, otherwise the order total).
+
+        Rules:
+        - A SHIPPED or already CANCELLED order cannot be cancelled.
+        - Cancelling releases this order's reservations. The units
+          never left the warehouse, so physical stock must be exactly
+          what it was before the order was placed.
+          Example: stock 10, order for 3 placed then cancelled:
+          stock 10, reserved 0, available 10 (not 13).
+        """
+        if self.status == "CREATED":
+            self.status = "CANCELLED"
+            return 0.0
+        if self.status not in ("PLACED", "PAID"):
+            raise ValueError(f"A {self.status} order cannot be cancelled")
+
+        for line in self.cart.lines():
+            self.inventory.release(line["sku"], line["quantity"])
+
+        if self.status == "PAID":
+            self.refund_due = self.breakdown.total
+        self.status = "CANCELLED"
+        return self.refund_due
+
+    def return_items(self, sku: str, quantity: int):
+        """
+        Return some units of a SHIPPED order and get a refund.
+
+        Rules:
+        - Only a SHIPPED order accepts returns.
+        - Quantity must be positive, and the total returned quantity
+          for a SKU can never exceed the purchased quantity.
+        - Returned units go back into physical stock.
+        - The refund uses the FROZEN paid price per unit (after
+          discount, including tax) captured at payment time — never
+          the product's current price.
+          Example: paid 106.2 per unit (see pay()). The product price
+          later rises to 150. Returning 1 unit must refund 106.2,
+          not 150 * 1.18 = 177.0.
+        - Returns the refund amount for this return. When every unit
+          of every line has been returned, status becomes "RETURNED".
+        """
+        if self.status not in ("SHIPPED", "RETURNED"):
+            raise ValueError("Only a SHIPPED order accepts returns")
+        if not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("Quantity must be a positive integer")
+
+        purchased = None
+        for line in self.cart.lines():
+            if line["sku"] == sku:
+                purchased = line["quantity"]
+                break
+        if purchased is None:
+            raise ValueError(f"SKU was not purchased in this order: {sku}")
+
+        already_returned = self._returned.get(sku, 0)
+        if already_returned + quantity > purchased:
+            raise ValueError("Cannot return more than was purchased")
+
+        refund = round(self._paid_unit_price_incl_tax[sku] * quantity, 2)
+
+        self.inventory.restock(sku, quantity)
+        self._returned[sku] = already_returned + quantity
+        self.total_refunded = round(self.total_refunded + refund, 2)
+
+        all_returned = True
+        for line in self.cart.lines():
+            if self._returned.get(line["sku"], 0) < line["quantity"]:
+                all_returned = False
+        if all_returned:
+            self.status = "RETURNED"
+        return refund
+
+    def get_returned_quantity(self, sku: str) -> int:
+        """How many units of a SKU have been returned so far."""
+        return self._returned.get(sku, 0)
